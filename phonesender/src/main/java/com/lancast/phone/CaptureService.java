@@ -26,8 +26,10 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 
 public class CaptureService extends Service {
+    private static final String TAG = "LanCast";
     private static final String CHANNEL = "lancast_capture";
     private static final int NOTIFICATION_ID = 42;
+
     private static final int WIDTH = 1280;
     private static final int HEIGHT = 720;
     private static final int FPS = 30;
@@ -39,6 +41,8 @@ public class CaptureService extends Service {
     private VirtualDisplay virtualDisplay;
     private MediaCodec encoder;
     private Socket socket;
+
+    private DataOutputStream out;
 
     @Override
     public void onCreate() {
@@ -67,19 +71,61 @@ public class CaptureService extends Service {
         return START_NOT_STICKY;
     }
 
+    private void sendPacket(int type, byte[] bytes, long pts, int flags)
+            throws Exception {
+        if (bytes == null || bytes.length == 0) return;
+
+        out.writeByte(type);
+        out.writeInt(bytes.length);
+        out.writeLong(pts);
+        out.writeInt(flags);
+        out.write(bytes);
+        out.flush();
+    }
+
+    private byte[] bufferToBytes(ByteBuffer source) {
+        ByteBuffer buffer = source.duplicate();
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+        return bytes;
+    }
+
+    private void sendCodecConfig(MediaFormat format) throws Exception {
+        if (format.containsKey("csd-0")) {
+            ByteBuffer sps = format.getByteBuffer("csd-0");
+            if (sps != null) {
+                byte[] bytes = bufferToBytes(sps);
+                sendPacket(0, bytes, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
+                Log.i(TAG, "Sent SPS: " + bytes.length + " bytes");
+            }
+        }
+
+        if (format.containsKey("csd-1")) {
+            ByteBuffer pps = format.getByteBuffer("csd-1");
+            if (pps != null) {
+                byte[] bytes = bufferToBytes(pps);
+                sendPacket(2, bytes, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
+                Log.i(TAG, "Sent PPS: " + bytes.length + " bytes");
+            }
+        }
+    }
+
     private void startStreaming(int resultCode, Intent data, String host) {
         try {
             if (data == null || host == null || host.isEmpty()) {
-                throw new IllegalArgumentException("Missing projection data or TV address");
+                throw new IllegalArgumentException(
+                        "Missing projection data or TV address"
+                );
             }
 
             socket = new Socket(host, 5000);
             socket.setTcpNoDelay(true);
-            DataOutputStream out =
-                    new DataOutputStream(socket.getOutputStream());
+            out = new DataOutputStream(socket.getOutputStream());
 
             MediaProjectionManager mpm =
-                    (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                    (MediaProjectionManager) getSystemService(
+                            MEDIA_PROJECTION_SERVICE
+                    );
 
             projection = mpm.getMediaProjection(resultCode, data);
 
@@ -87,11 +133,10 @@ public class CaptureService extends Service {
                 throw new IllegalStateException("MediaProjection is null");
             }
 
-            // Android 14+ requires a callback before createVirtualDisplay().
             projectionCallback = new MediaProjection.Callback() {
                 @Override
                 public void onStop() {
-                    Log.i("LanCast", "MediaProjection stopped by system");
+                    Log.i(TAG, "MediaProjection stopped by system");
                     running = false;
                 }
             };
@@ -145,46 +190,62 @@ public class CaptureService extends Service {
             );
 
             if (virtualDisplay == null) {
-                throw new IllegalStateException("Failed to create VirtualDisplay");
+                throw new IllegalStateException(
+                        "Failed to create VirtualDisplay"
+                );
             }
 
-            Log.i("LanCast", "Capture started successfully");
+            Log.i(TAG, "Capture started successfully");
 
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
 
-            while (running) {
+            while (running && !socket.isClosed()) {
                 int index = encoder.dequeueOutputBuffer(info, 10000);
 
                 if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    Log.i("LanCast", "Encoder output format: " +
-                            encoder.getOutputFormat());
+                    MediaFormat outputFormat = encoder.getOutputFormat();
+
+                    Log.i(TAG, "Encoder output format: " + outputFormat);
+
+                    sendCodecConfig(outputFormat);
+                    continue;
+                }
+
+                if (index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
                     continue;
                 }
 
                 if (index >= 0) {
-                    ByteBuffer buffer = encoder.getOutputBuffer(index);
+                    try {
+                        // Codec configuration is sent from csd-0/csd-1.
+                        if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
+                                && info.size > 0) {
 
-                    if (buffer != null && info.size > 0) {
-                        byte[] bytes = new byte[info.size];
+                            ByteBuffer buffer = encoder.getOutputBuffer(index);
 
-                        buffer.position(info.offset);
-                        buffer.limit(info.offset + info.size);
-                        buffer.get(bytes);
+                            if (buffer != null) {
+                                buffer.position(info.offset);
+                                buffer.limit(info.offset + info.size);
 
-                        out.writeByte(1);
-                        out.writeInt(bytes.length);
-                        out.writeLong(info.presentationTimeUs);
-                        out.writeInt(info.flags);
-                        out.write(bytes);
-                        out.flush();
+                                byte[] bytes = new byte[info.size];
+                                buffer.get(bytes);
+
+                                sendPacket(
+                                        1,
+                                        bytes,
+                                        info.presentationTimeUs,
+                                        info.flags
+                                );
+                            }
+                        }
+                    } finally {
+                        encoder.releaseOutputBuffer(index, false);
                     }
-
-                    encoder.releaseOutputBuffer(index, false);
                 }
             }
 
         } catch (Exception e) {
-            Log.e("LanCast", "Capture failed", e);
+            Log.e(TAG, "Capture failed", e);
         } finally {
             cleanup();
             stopSelf();
@@ -222,6 +283,8 @@ public class CaptureService extends Service {
                 socket = null;
             }
         } catch (Exception ignored) {}
+
+        out = null;
 
         stopForeground(true);
     }
